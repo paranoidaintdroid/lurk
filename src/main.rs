@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fmt, fs, io, process, thread,
     time::{Duration, Instant},
 };
@@ -391,9 +391,7 @@ fn read_thread_affinity(pid: u32, tid: u32) -> Result<String, LurkError> {
         }
     }
 
-    Err(LurkError::MalformedStatus(
-        "missing Cpus_allowed_list",
-    ))
+    Err(LurkError::MalformedStatus("missing Cpus_allowed_list"))
 }
 
 fn take_snapshot(pid: u32) -> Result<Snapshot, LurkError> {
@@ -544,7 +542,7 @@ fn print_threads(pid: u32) -> Result<(), LurkError> {
     println!("Threads: {}", snapshot.threads.len());
     println!();
 
-   println!(
+    println!(
         "{:<8} {:<16} {:<7} {:>10} {:>10} {:>8} {:>12}",
         "TID", "NAME", "STATE", "USER", "SYSTEM", "LASTCPU", "ALLOWED"
     );
@@ -555,7 +553,13 @@ fn print_threads(pid: u32) -> Result<(), LurkError> {
 
         println!(
             "{:<8} {:<16} {:<7} {:>9.3}s {:>9.3}s {:>8} {:>12}",
-            thread.tid, thread.name, thread.state, user_seconds, system_seconds, thread.processor, thread.allowed_cpus,
+            thread.tid,
+            thread.name,
+            thread.state,
+            user_seconds,
+            system_seconds,
+            thread.processor,
+            thread.allowed_cpus,
         );
     }
 
@@ -565,6 +569,8 @@ fn print_threads(pid: u32) -> Result<(), LurkError> {
 fn watch_threads(pid: u32) -> Result<(), LurkError> {
     let ticks_per_second = clock_ticks_per_second();
     let mut previous = take_thread_snapshot(pid)?;
+
+    let mut migration_counts: HashMap<(u32, u64), u64> = HashMap::new();
 
     loop {
         thread::sleep(Duration::from_secs(1));
@@ -592,10 +598,10 @@ fn watch_threads(pid: u32) -> Result<(), LurkError> {
             .duration_since(previous.timestamp)
             .as_secs_f64();
 
-        let previous_threads: HashMap<u32, &ThreadStats> = previous
+        let previous_threads: HashMap<(u32, u64), &ThreadStats> = previous
             .threads
             .iter()
-            .map(|thread| (thread.tid, thread))
+            .map(|thread| ((thread.tid, thread.start_time_ticks), thread))
             .collect();
 
         println!(
@@ -606,52 +612,74 @@ fn watch_threads(pid: u32) -> Result<(), LurkError> {
         );
 
         println!(
-            "{:<8} {:<16} {:<5} {:>9} {:>8} {:>12} {:>10} {:>10}",
-            "TID", "NAME", "STATE", "CPU%", "LASTCPU", "ALLOWED", "USER", "SYSTEM"
+            "{:<8} {:<16} {:<5} {:>9} {:>8} {:>12} {:>7} {:>10}",
+            "TID", "NAME", "STATE", "CPU%", "LASTCPU", "ALLOWED", "MIGR", "MOVE"
         );
 
         for current_thread in &current.threads {
-            let previous_thread = previous_threads.get(&current_thread.tid).copied();
+            let identity = (current_thread.tid, current_thread.start_time_ticks);
+            let previous_thread = previous_threads.get(&identity).copied();
 
-            let cpu = previous_thread
-                .filter(|previous_thread| {
-                    previous_thread.start_time_ticks == current_thread.start_time_ticks
-                })
-                .map(|previous_thread| {
-                    thread_cpu_percent(previous_thread, current_thread, elapsed, ticks_per_second)
-                });
+            let cpu = previous_thread.map(|previous_thread| {
+                thread_cpu_percent(previous_thread, current_thread, elapsed, ticks_per_second)
+            });
 
-            let user_seconds = current_thread.user_ticks as f64 / ticks_per_second as f64;
+            let moved_from = previous_thread.and_then(|previous_thread| {
+                if previous_thread.processor != current_thread.processor {
+                    Some(previous_thread.processor)
+                } else {
+                    None
+                }
+            });
 
-            let system_seconds = current_thread.system_ticks as f64 / ticks_per_second as f64;
+            let migration_count = migration_counts.entry(identity).or_insert(0);
+
+            if moved_from.is_some() {
+                *migration_count += 1;
+            }
+
+            let move_text = match moved_from {
+                Some(previous_cpu) => {
+                    format!("{previous_cpu}->{}", current_thread.processor)
+                }
+                None => "-".to_string(),
+            };
 
             match cpu {
                 Some(cpu) => println!(
-                    "{:<8} {:<16} {:<5} {:>8.2}% {:>8} {:>12} {:>9.3}s {:>9.3}s",
+                    "{:<8} {:<16} {:<5} {:>8.2}% {:>8} {:>12} {:>7} {:>10}",
                     current_thread.tid,
                     current_thread.name,
                     current_thread.state,
                     cpu,
                     current_thread.processor,
                     current_thread.allowed_cpus,
-                    user_seconds,
-                    system_seconds,
+                    migration_count,
+                    move_text,
                 ),
                 None => println!(
-                    "{:<8} {:<16} {:<5} {:>9} {:>8} {:>12} {:>9.3}s {:>9.3}s",
+                    "{:<8} {:<16} {:<5} {:>9} {:>8} {:>12} {:>7} {:>10}",
                     current_thread.tid,
                     current_thread.name,
                     current_thread.state,
                     "new",
                     current_thread.processor,
                     current_thread.allowed_cpus,
-                    user_seconds,
-                    system_seconds,
+                    migration_count,
+                    move_text,
                 ),
             }
         }
 
         println!();
+
+        let live_threads: HashSet<(u32, u64)> = current
+            .threads
+            .iter()
+            .map(|thread| (thread.tid, thread.start_time_ticks))
+            .collect();
+
+        migration_counts.retain(|identity, _| live_threads.contains(identity));
 
         previous = current;
     }
