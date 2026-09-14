@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fmt, fs, io, process, thread,
     time::{Duration, Instant},
 };
@@ -8,27 +9,40 @@ struct ProcessStats {
     pid: u32,
     name: String,
     state: char,
-
     minor_faults: u64,
     major_faults: u64,
-
     user_ticks: u64,
     system_ticks: u64,
-
     threads: u64,
-
     start_time_ticks: u64,
-
     virtual_memory: u64,
     rss_pages: i64,
-
     voluntary_context_switches: u64,
     involuntary_context_switches: u64,
 }
 
 #[derive(Debug)]
+struct ThreadStats {
+    tid: u32,
+    name: String,
+    state: char,
+    user_ticks: u64,
+    system_ticks: u64,
+    start_time_ticks: u64,
+    processor: i32,
+    allowed_cpus: String,
+}
+
+#[derive(Debug)]
 struct Snapshot {
     stats: ProcessStats,
+    timestamp: Instant,
+}
+
+#[derive(Debug)]
+struct ThreadSnapshot {
+    process: ProcessStats,
+    threads: Vec<ThreadStats>,
     timestamp: Instant,
 }
 
@@ -48,15 +62,12 @@ enum LurkError {
 impl fmt::Display for LurkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LurkError::Usage => {
-                write!(f, "usage: lurk <pid>\n             lurk watch <pid>")
-            }
-            LurkError::InvalidPid(value) => {
-                write!(f, "invalid PID: {value}")
-            }
-            LurkError::ProcessNotFound(pid) => {
-                write!(f, "process {pid} not found")
-            }
+            LurkError::Usage => write!(
+                f,
+                "usage: lurk <pid>\n       lurk watch <pid>\n       lurk threads <pid>\n       lurk threads <pid> --watch"
+            ),
+            LurkError::InvalidPid(value) => write!(f, "invalid PID: {value}"),
+            LurkError::ProcessNotFound(pid) => write!(f, "process {pid} not found"),
             LurkError::PermissionDenied(pid) => {
                 write!(f, "permission denied while inspecting process {pid}")
             }
@@ -82,7 +93,9 @@ impl fmt::Display for LurkError {
 impl std::error::Error for LurkError {}
 
 fn parse_pid(value: &str) -> Result<u32, LurkError> {
-    let pid = value.parse::<u32>().map_err(|_| LurkError::InvalidPid(value.to_string()))?;
+    let pid = value
+        .parse::<u32>()
+        .map_err(|_| LurkError::InvalidPid(value.to_string()))?;
 
     if pid == 0 {
         return Err(LurkError::InvalidPid(value.to_string()));
@@ -92,68 +105,138 @@ fn parse_pid(value: &str) -> Result<u32, LurkError> {
 }
 
 fn parse_u64_field(fields: &[&str], index: usize, name: &'static str) -> Result<u64, LurkError> {
-    let value = fields.get(index).ok_or(LurkError::MalformedStat("missing fields"))?;
+    let value = fields
+        .get(index)
+        .ok_or(LurkError::MalformedStat("missing fields"))?;
 
-    value.parse::<u64>().map_err(|_| LurkError::InvalidStatField {
-        field: name,
-        value: (*value).to_string(),
-    })
+    value
+        .parse::<u64>()
+        .map_err(|_| LurkError::InvalidStatField {
+            field: name,
+            value: (*value).to_string(),
+        })
 }
 
 fn parse_i64_field(fields: &[&str], index: usize, name: &'static str) -> Result<i64, LurkError> {
-    let value = fields.get(index).ok_or(LurkError::MalformedStat("missing fields"))?;
+    let value = fields
+        .get(index)
+        .ok_or(LurkError::MalformedStat("missing fields"))?;
 
-    value.parse::<i64>().map_err(|_| LurkError::InvalidStatField {
-        field: name,
-        value: (*value).to_string(),
-    })
+    value
+        .parse::<i64>()
+        .map_err(|_| LurkError::InvalidStatField {
+            field: name,
+            value: (*value).to_string(),
+        })
 }
 
 fn parse_stat(contents: &str) -> Result<ProcessStats, LurkError> {
-    let open_paren = contents.find('(').ok_or(LurkError::MalformedStat("missing opening parenthesis"))?;
-    let close_paren = contents.rfind(')').ok_or(LurkError::MalformedStat("missing closing parenthesis"))?;
+    let open_paren = contents
+        .find('(')
+        .ok_or(LurkError::MalformedStat("missing opening parenthesis"))?;
+
+    let close_paren = contents
+        .rfind(')')
+        .ok_or(LurkError::MalformedStat("missing closing parenthesis"))?;
 
     if close_paren <= open_paren {
         return Err(LurkError::MalformedStat("invalid process name boundaries"));
     }
 
     let pid_text = contents[..open_paren].trim();
-    let pid = pid_text.parse::<u32>().map_err(|_| LurkError::InvalidStatField {
-        field: "pid",
-        value: pid_text.to_string(),
-    })?;
+
+    let pid = pid_text
+        .parse::<u32>()
+        .map_err(|_| LurkError::InvalidStatField {
+            field: "pid",
+            value: pid_text.to_string(),
+        })?;
 
     let name = contents[open_paren + 1..close_paren].to_string();
     let remaining = contents[close_paren + 1..].trim();
     let fields: Vec<&str> = remaining.split_whitespace().collect();
 
-    let state_text = fields.first().ok_or(LurkError::MalformedStat("missing process state"))?;
-    let state = state_text.chars().next().ok_or(LurkError::MalformedStat("empty process state"))?;
+    let state_text = fields
+        .first()
+        .ok_or(LurkError::MalformedStat("missing process state"))?;
+
+    let state = state_text
+        .chars()
+        .next()
+        .ok_or(LurkError::MalformedStat("empty process state"))?;
 
     Ok(ProcessStats {
         pid,
         name,
         state,
-
-        // Linux field 10
         minor_faults: parse_u64_field(&fields, 7, "minflt")?,
-        // Linux field 12
         major_faults: parse_u64_field(&fields, 9, "majflt")?,
-        // Linux field 14
         user_ticks: parse_u64_field(&fields, 11, "utime")?,
-        // Linux field 15
         system_ticks: parse_u64_field(&fields, 12, "stime")?,
-        // Linux field 20
         threads: parse_u64_field(&fields, 17, "num_threads")?,
-        // Linux field 22
         start_time_ticks: parse_u64_field(&fields, 19, "starttime")?,
-        // Linux field 23
         virtual_memory: parse_u64_field(&fields, 20, "vsize")?,
-        // Linux field 24
         rss_pages: parse_i64_field(&fields, 21, "rss")?,
-
         voluntary_context_switches: 0,
         involuntary_context_switches: 0,
+    })
+}
+
+fn parse_thread_stat(contents: &str) -> Result<ThreadStats, LurkError> {
+    let open_paren = contents
+        .find('(')
+        .ok_or(LurkError::MalformedStat("missing opening parenthesis"))?;
+
+    let close_paren = contents
+        .rfind(')')
+        .ok_or(LurkError::MalformedStat("missing closing parenthesis"))?;
+
+    if close_paren <= open_paren {
+        return Err(LurkError::MalformedStat("invalid thread name boundaries"));
+    }
+
+    let tid_text = contents[..open_paren].trim();
+
+    let tid = tid_text
+        .parse::<u32>()
+        .map_err(|_| LurkError::InvalidStatField {
+            field: "tid",
+            value: tid_text.to_string(),
+        })?;
+
+    let name = contents[open_paren + 1..close_paren].to_string();
+    let remaining = contents[close_paren + 1..].trim();
+    let fields: Vec<&str> = remaining.split_whitespace().collect();
+
+    let state_text = fields
+        .first()
+        .ok_or(LurkError::MalformedStat("missing thread state"))?;
+
+    let state = state_text
+        .chars()
+        .next()
+        .ok_or(LurkError::MalformedStat("empty thread state"))?;
+
+    let processor_text = fields
+        .get(36)
+        .ok_or(LurkError::MalformedStat("missing processor field"))?;
+
+    let processor = processor_text
+        .parse::<i32>()
+        .map_err(|_| LurkError::InvalidStatField {
+            field: "processor",
+            value: (*processor_text).to_string(),
+        })?;
+
+    Ok(ThreadStats {
+        tid,
+        name,
+        state,
+        user_ticks: parse_u64_field(&fields, 11, "utime")?,
+        system_ticks: parse_u64_field(&fields, 12, "stime")?,
+        start_time_ticks: parse_u64_field(&fields, 19, "starttime")?,
+        processor,
+        allowed_cpus: String::new(),
     })
 }
 
@@ -165,7 +248,10 @@ fn read_proc_file(pid: u32, file: &str) -> Result<String, LurkError> {
         Err(error) => match error.kind() {
             io::ErrorKind::NotFound => Err(LurkError::ProcessNotFound(pid)),
             io::ErrorKind::PermissionDenied => Err(LurkError::PermissionDenied(pid)),
-            _ => Err(LurkError::Io { path, source: error }),
+            _ => Err(LurkError::Io {
+                path,
+                source: error,
+            }),
         },
     }
 }
@@ -188,8 +274,13 @@ fn read_context_switches(pid: u32) -> Result<(u64, u64), LurkError> {
         }
     }
 
-    let voluntary = voluntary.ok_or(LurkError::MalformedStatus("missing voluntary context switch counter"))?;
-    let involuntary = involuntary.ok_or(LurkError::MalformedStatus("missing involuntary context switch counter"))?;
+    let voluntary = voluntary.ok_or(LurkError::MalformedStatus(
+        "missing voluntary context switch counter",
+    ))?;
+
+    let involuntary = involuntary.ok_or(LurkError::MalformedStatus(
+        "missing involuntary context switch counter",
+    ))?;
 
     Ok((voluntary, involuntary))
 }
@@ -200,7 +291,6 @@ fn read_stat_only(pid: u32) -> Result<ProcessStats, LurkError> {
 }
 
 fn read_stats(pid: u32) -> Result<ProcessStats, LurkError> {
-
     let before = read_stat_only(pid)?;
     let (voluntary, involuntary) = read_context_switches(pid)?;
     let mut after = read_stat_only(pid)?;
@@ -215,6 +305,97 @@ fn read_stats(pid: u32) -> Result<ProcessStats, LurkError> {
     Ok(after)
 }
 
+fn read_threads(pid: u32) -> Result<Vec<ThreadStats>, LurkError> {
+    let path = format!("/proc/{pid}/task");
+
+    let entries = fs::read_dir(&path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => LurkError::ProcessNotFound(pid),
+        io::ErrorKind::PermissionDenied => LurkError::PermissionDenied(pid),
+        _ => LurkError::Io {
+            path: path.clone(),
+            source: error,
+        },
+    })?;
+
+    let mut threads = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|error| LurkError::Io {
+            path: path.clone(),
+            source: error,
+        })?;
+
+        let file_name = entry.file_name();
+
+        let Some(tid_text) = file_name.to_str() else {
+            continue;
+        };
+
+        let Ok(tid) = tid_text.parse::<u32>() else {
+            continue;
+        };
+
+        let stat_path = format!("/proc/{pid}/task/{tid}/stat");
+
+        let contents = match fs::read_to_string(&stat_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(LurkError::PermissionDenied(pid));
+            }
+            Err(error) => {
+                return Err(LurkError::Io {
+                    path: stat_path,
+                    source: error,
+                });
+            }
+        };
+
+        let mut thread = parse_thread_stat(&contents)?;
+
+        thread.allowed_cpus = match read_thread_affinity(pid, tid) {
+            Ok(allowed_cpus) => allowed_cpus,
+
+            Err(LurkError::ProcessNotFound(_)) => {
+                continue;
+            }
+
+            Err(error) => {
+                return Err(error);
+            }
+        };
+
+        threads.push(thread);
+    }
+
+    threads.sort_unstable_by_key(|thread| thread.tid);
+
+    Ok(threads)
+}
+
+fn read_thread_affinity(pid: u32, tid: u32) -> Result<String, LurkError> {
+    let path = format!("/proc/{pid}/task/{tid}/status");
+
+    let contents = fs::read_to_string(&path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => LurkError::ProcessNotFound(pid),
+        io::ErrorKind::PermissionDenied => LurkError::PermissionDenied(pid),
+        _ => LurkError::Io {
+            path: path.clone(),
+            source: error,
+        },
+    })?;
+
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("Cpus_allowed_list:") {
+            return Ok(value.trim().to_string());
+        }
+    }
+
+    Err(LurkError::MalformedStatus(
+        "missing Cpus_allowed_list",
+    ))
+}
+
 fn take_snapshot(pid: u32) -> Result<Snapshot, LurkError> {
     let timestamp = Instant::now();
     let stats = read_stats(pid)?;
@@ -222,15 +403,36 @@ fn take_snapshot(pid: u32) -> Result<Snapshot, LurkError> {
     Ok(Snapshot { stats, timestamp })
 }
 
+fn take_thread_snapshot(pid: u32) -> Result<ThreadSnapshot, LurkError> {
+    let timestamp = Instant::now();
+    let process = read_stats(pid)?;
+    let threads = read_threads(pid)?;
+    let after = read_stat_only(pid)?;
+
+    if process.start_time_ticks != after.start_time_ticks {
+        return Err(LurkError::ProcessReused(pid));
+    }
+
+    Ok(ThreadSnapshot {
+        process,
+        threads,
+        timestamp,
+    })
+}
+
 fn clock_ticks_per_second() -> u64 {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+
     assert!(ticks > 0);
+
     ticks as u64
 }
 
 fn page_size() -> u64 {
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+
     assert!(size > 0);
+
     size as u64
 }
 
@@ -246,9 +448,25 @@ fn cpu_percent(
 ) -> f64 {
     let previous_ticks = previous.user_ticks + previous.system_ticks;
     let current_ticks = current.user_ticks + current.system_ticks;
-    let delta_ticks = current_ticks - previous_ticks;
+    let delta_ticks = current_ticks.saturating_sub(previous_ticks);
 
     let cpu_seconds = delta_ticks as f64 / ticks_per_second as f64;
+
+    cpu_seconds / elapsed_seconds * 100.0
+}
+
+fn thread_cpu_percent(
+    previous: &ThreadStats,
+    current: &ThreadStats,
+    elapsed_seconds: f64,
+    ticks_per_second: u64,
+) -> f64 {
+    let previous_ticks = previous.user_ticks + previous.system_ticks;
+    let current_ticks = current.user_ticks + current.system_ticks;
+    let delta_ticks = current_ticks.saturating_sub(previous_ticks);
+
+    let cpu_seconds = delta_ticks as f64 / ticks_per_second as f64;
+
     cpu_seconds / elapsed_seconds * 100.0
 }
 
@@ -278,18 +496,26 @@ fn watch_process(pid: u32) -> Result<(), LurkError> {
             return Ok(());
         }
 
-        let elapsed = current.timestamp.duration_since(previous.timestamp).as_secs_f64();
+        let elapsed = current
+            .timestamp
+            .duration_since(previous.timestamp)
+            .as_secs_f64();
+
         let cpu = cpu_percent(&previous.stats, &current.stats, elapsed, ticks_per_second);
 
         let rss_bytes = current.stats.rss_pages as u64 * page_size;
         let rss_mib = bytes_to_mib(rss_bytes);
 
-        let minor_faults_per_sec = (current.stats.minor_faults - previous.stats.minor_faults) as f64 / elapsed;
-        let major_faults_per_sec = (current.stats.major_faults - previous.stats.major_faults) as f64 / elapsed;
+        let minor_faults_per_sec =
+            (current.stats.minor_faults - previous.stats.minor_faults) as f64 / elapsed;
+
+        let major_faults_per_sec =
+            (current.stats.major_faults - previous.stats.major_faults) as f64 / elapsed;
 
         let voluntary_per_sec = (current.stats.voluntary_context_switches
             - previous.stats.voluntary_context_switches) as f64
             / elapsed;
+
         let involuntary_per_sec = (current.stats.involuntary_context_switches
             - previous.stats.involuntary_context_switches) as f64
             / elapsed;
@@ -301,6 +527,130 @@ fn watch_process(pid: u32) -> Result<(), LurkError> {
         println!("Major faults:  {:>8.2} /s", major_faults_per_sec);
         println!("Vol ctx sw:    {:>8.2} /s", voluntary_per_sec);
         println!("Invol ctx sw:  {:>8.2} /s", involuntary_per_sec);
+        println!();
+
+        previous = current;
+    }
+}
+
+fn print_threads(pid: u32) -> Result<(), LurkError> {
+    let snapshot = take_thread_snapshot(pid)?;
+    let ticks_per_second = clock_ticks_per_second();
+
+    println!(
+        "Process: {} ({})",
+        snapshot.process.name, snapshot.process.pid
+    );
+    println!("Threads: {}", snapshot.threads.len());
+    println!();
+
+   println!(
+        "{:<8} {:<16} {:<7} {:>10} {:>10} {:>8} {:>12}",
+        "TID", "NAME", "STATE", "USER", "SYSTEM", "LASTCPU", "ALLOWED"
+    );
+
+    for thread in snapshot.threads {
+        let user_seconds = thread.user_ticks as f64 / ticks_per_second as f64;
+        let system_seconds = thread.system_ticks as f64 / ticks_per_second as f64;
+
+        println!(
+            "{:<8} {:<16} {:<7} {:>9.3}s {:>9.3}s {:>8} {:>12}",
+            thread.tid, thread.name, thread.state, user_seconds, system_seconds, thread.processor, thread.allowed_cpus,
+        );
+    }
+
+    Ok(())
+}
+
+fn watch_threads(pid: u32) -> Result<(), LurkError> {
+    let ticks_per_second = clock_ticks_per_second();
+    let mut previous = take_thread_snapshot(pid)?;
+
+    loop {
+        thread::sleep(Duration::from_secs(1));
+
+        let current = match take_thread_snapshot(pid) {
+            Ok(snapshot) => snapshot,
+            Err(LurkError::ProcessNotFound(_)) => {
+                println!("process {pid} exited");
+                return Ok(());
+            }
+            Err(LurkError::ProcessReused(_)) => {
+                println!("process {pid} exited; PID was reused");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        if previous.process.start_time_ticks != current.process.start_time_ticks {
+            println!("process {pid} exited; PID was reused");
+            return Ok(());
+        }
+
+        let elapsed = current
+            .timestamp
+            .duration_since(previous.timestamp)
+            .as_secs_f64();
+
+        let previous_threads: HashMap<u32, &ThreadStats> = previous
+            .threads
+            .iter()
+            .map(|thread| (thread.tid, thread))
+            .collect();
+
+        println!(
+            "{} ({}) - {} threads",
+            current.process.name,
+            current.process.pid,
+            current.threads.len()
+        );
+
+        println!(
+            "{:<8} {:<16} {:<5} {:>9} {:>8} {:>12} {:>10} {:>10}",
+            "TID", "NAME", "STATE", "CPU%", "LASTCPU", "ALLOWED", "USER", "SYSTEM"
+        );
+
+        for current_thread in &current.threads {
+            let previous_thread = previous_threads.get(&current_thread.tid).copied();
+
+            let cpu = previous_thread
+                .filter(|previous_thread| {
+                    previous_thread.start_time_ticks == current_thread.start_time_ticks
+                })
+                .map(|previous_thread| {
+                    thread_cpu_percent(previous_thread, current_thread, elapsed, ticks_per_second)
+                });
+
+            let user_seconds = current_thread.user_ticks as f64 / ticks_per_second as f64;
+
+            let system_seconds = current_thread.system_ticks as f64 / ticks_per_second as f64;
+
+            match cpu {
+                Some(cpu) => println!(
+                    "{:<8} {:<16} {:<5} {:>8.2}% {:>8} {:>12} {:>9.3}s {:>9.3}s",
+                    current_thread.tid,
+                    current_thread.name,
+                    current_thread.state,
+                    cpu,
+                    current_thread.processor,
+                    current_thread.allowed_cpus,
+                    user_seconds,
+                    system_seconds,
+                ),
+                None => println!(
+                    "{:<8} {:<16} {:<5} {:>9} {:>8} {:>12} {:>9.3}s {:>9.3}s",
+                    current_thread.tid,
+                    current_thread.name,
+                    current_thread.state,
+                    "new",
+                    current_thread.processor,
+                    current_thread.allowed_cpus,
+                    user_seconds,
+                    system_seconds,
+                ),
+            }
+        }
+
         println!();
 
         previous = current;
@@ -323,12 +673,21 @@ fn print_stats(stats: &ProcessStats) {
     println!("User CPU:   {:.3} s", user_seconds);
     println!("System CPU: {:.3} s", system_seconds);
     println!("Threads: {}", stats.threads);
-    println!("Virtual memory: {:.2} MiB", bytes_to_mib(stats.virtual_memory));
+    println!(
+        "Virtual memory: {:.2} MiB",
+        bytes_to_mib(stats.virtual_memory)
+    );
     println!("RSS: {:.2} MiB", bytes_to_mib(rss_bytes));
     println!("Minor faults: {}", stats.minor_faults);
     println!("Major faults: {}", stats.major_faults);
-    println!("Voluntary context switches: {}", stats.voluntary_context_switches);
-    println!("Involuntary context switches: {}", stats.involuntary_context_switches);
+    println!(
+        "Voluntary context switches: {}",
+        stats.voluntary_context_switches
+    );
+    println!(
+        "Involuntary context switches: {}",
+        stats.involuntary_context_switches
+    );
 }
 
 fn run() -> Result<(), LurkError> {
@@ -346,12 +705,30 @@ fn run() -> Result<(), LurkError> {
         return watch_process(pid);
     }
 
+    if first == "threads" {
+        let pid_arg = args.next().ok_or(LurkError::Usage)?;
+        let option = args.next();
+
+        if args.next().is_some() {
+            return Err(LurkError::Usage);
+        }
+
+        let pid = parse_pid(&pid_arg)?;
+
+        return match option.as_deref() {
+            None => print_threads(pid),
+            Some("--watch") => watch_threads(pid),
+            Some(_) => Err(LurkError::Usage),
+        };
+    }
+
     if args.next().is_some() {
         return Err(LurkError::Usage);
     }
 
     let pid = parse_pid(&first)?;
     let stats = read_stats(pid)?;
+
     print_stats(&stats);
 
     Ok(())
@@ -390,8 +767,8 @@ mod tests {
 
     #[test]
     fn parses_name_with_spaces() {
-        let input =
-            "4321 (my weird process) R 100 200 300 400 500 600 7 800 9 10 11 12 13 14 15 16 17 18 19 20 21";
+        let input = "4321 (my weird process) R 100 200 300 400 500 600 7 800 9 10 11 12 13 14 15 16 17 18 19 20 21";
+
         let stats = parse_stat(input).unwrap();
 
         assert_eq!(stats.pid, 4321);
@@ -401,8 +778,8 @@ mod tests {
 
     #[test]
     fn parses_name_with_closing_parenthesis() {
-        let input =
-            "9876 (worker)thread) S 100 200 300 400 500 600 7 800 9 10 11 12 13 14 15 16 17 18 19 20 21";
+        let input = "9876 (worker)thread) S 100 200 300 400 500 600 7 800 9 10 11 12 13 14 15 16 17 18 19 20 21";
+
         let stats = parse_stat(input).unwrap();
 
         assert_eq!(stats.pid, 9876);
@@ -426,6 +803,7 @@ mod tests {
     fn rejects_truncated_proc_stat() {
         let input = "1234 (bash) S 1 2 3";
         let result = parse_stat(input);
+
         assert!(matches!(result, Err(LurkError::MalformedStat(_))));
     }
 
@@ -433,6 +811,23 @@ mod tests {
     fn rejects_missing_process_name_delimiter() {
         let input = "1234 bash S 1 2 3";
         let result = parse_stat(input);
+
         assert!(matches!(result, Err(LurkError::MalformedStat(_))));
+    }
+
+    #[test]
+    fn parses_thread_stat() {
+        let input = "5678 (worker-0) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37";
+
+        let stats = parse_thread_stat(input).unwrap();
+
+        assert_eq!(stats.tid, 5678);
+        assert_eq!(stats.name, "worker-0");
+        assert_eq!(stats.state, 'R');
+        assert_eq!(stats.user_ticks, 11);
+        assert_eq!(stats.system_ticks, 12);
+        assert_eq!(stats.start_time_ticks, 19);
+        assert_eq!(stats.processor, 36);
+        assert_eq!(stats.allowed_cpus, "");
     }
 }
