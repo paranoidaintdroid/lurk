@@ -34,6 +34,24 @@ struct ThreadStats {
 }
 
 #[derive(Debug)]
+struct IoStats {
+    rchar: u64,
+    wchar: u64,
+    syscr: u64,
+    syscw: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    cancelled_write_bytes: i64,
+}
+
+#[derive(Debug)]
+struct IoSnapshot {
+    process: ProcessStats,
+    io: IoStats,
+    timestamp: Instant,
+}
+
+#[derive(Debug)]
 struct Snapshot {
     stats: ProcessStats,
     timestamp: Instant,
@@ -57,6 +75,8 @@ enum LurkError {
     InvalidStatField { field: &'static str, value: String },
     MalformedStatus(&'static str),
     Io { path: String, source: io::Error },
+    MalformedIo(&'static str),
+    InvalidIoField { field: &'static str, value: String },
 }
 
 impl fmt::Display for LurkError {
@@ -64,7 +84,7 @@ impl fmt::Display for LurkError {
         match self {
             LurkError::Usage => write!(
                 f,
-                "usage: lurk <pid>\n       lurk watch <pid>\n       lurk threads <pid>\n       lurk threads <pid> --watch"
+                "usage: lurk <pid>\n       lurk watch <pid>\n       lurk threads <pid>\n       lurk threads <pid> --watch\n       lurk io <pid>\n       lurk io <pid> --watch"
             ),
             LurkError::InvalidPid(value) => write!(f, "invalid PID: {value}"),
             LurkError::ProcessNotFound(pid) => write!(f, "process {pid} not found"),
@@ -85,6 +105,12 @@ impl fmt::Display for LurkError {
             }
             LurkError::Io { path, source } => {
                 write!(f, "failed to read {path}: {source}")
+            }
+            LurkError::MalformedIo(reason) => {
+                write!(f, "malformed /proc/<pid>/io: {reason}")
+            }
+            LurkError::InvalidIoField { field, value } => {
+                write!(f, "invalid value for io field {field}: {value}")
             }
         }
     }
@@ -305,6 +331,27 @@ fn read_stats(pid: u32) -> Result<ProcessStats, LurkError> {
     Ok(after)
 }
 
+fn read_thread_affinity(pid: u32, tid: u32) -> Result<String, LurkError> {
+    let path = format!("/proc/{pid}/task/{tid}/status");
+
+    let contents = fs::read_to_string(&path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => LurkError::ProcessNotFound(pid),
+        io::ErrorKind::PermissionDenied => LurkError::PermissionDenied(pid),
+        _ => LurkError::Io {
+            path: path.clone(),
+            source: error,
+        },
+    })?;
+
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("Cpus_allowed_list:") {
+            return Ok(value.trim().to_string());
+        }
+    }
+
+    Err(LurkError::MalformedStatus("missing Cpus_allowed_list"))
+}
+
 fn read_threads(pid: u32) -> Result<Vec<ThreadStats>, LurkError> {
     let path = format!("/proc/{pid}/task");
 
@@ -355,14 +402,8 @@ fn read_threads(pid: u32) -> Result<Vec<ThreadStats>, LurkError> {
 
         thread.allowed_cpus = match read_thread_affinity(pid, tid) {
             Ok(allowed_cpus) => allowed_cpus,
-
-            Err(LurkError::ProcessNotFound(_)) => {
-                continue;
-            }
-
-            Err(error) => {
-                return Err(error);
-            }
+            Err(LurkError::ProcessNotFound(_)) => continue,
+            Err(error) => return Err(error),
         };
 
         threads.push(thread);
@@ -371,27 +412,6 @@ fn read_threads(pid: u32) -> Result<Vec<ThreadStats>, LurkError> {
     threads.sort_unstable_by_key(|thread| thread.tid);
 
     Ok(threads)
-}
-
-fn read_thread_affinity(pid: u32, tid: u32) -> Result<String, LurkError> {
-    let path = format!("/proc/{pid}/task/{tid}/status");
-
-    let contents = fs::read_to_string(&path).map_err(|error| match error.kind() {
-        io::ErrorKind::NotFound => LurkError::ProcessNotFound(pid),
-        io::ErrorKind::PermissionDenied => LurkError::PermissionDenied(pid),
-        _ => LurkError::Io {
-            path: path.clone(),
-            source: error,
-        },
-    })?;
-
-    for line in contents.lines() {
-        if let Some(value) = line.strip_prefix("Cpus_allowed_list:") {
-            return Ok(value.trim().to_string());
-        }
-    }
-
-    Err(LurkError::MalformedStatus("missing Cpus_allowed_list"))
 }
 
 fn take_snapshot(pid: u32) -> Result<Snapshot, LurkError> {
@@ -435,6 +455,10 @@ fn page_size() -> u64 {
 }
 
 fn bytes_to_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn signed_bytes_to_mib(bytes: i64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
@@ -504,18 +528,30 @@ fn watch_process(pid: u32) -> Result<(), LurkError> {
         let rss_bytes = current.stats.rss_pages as u64 * page_size;
         let rss_mib = bytes_to_mib(rss_bytes);
 
-        let minor_faults_per_sec =
-            (current.stats.minor_faults - previous.stats.minor_faults) as f64 / elapsed;
-
-        let major_faults_per_sec =
-            (current.stats.major_faults - previous.stats.major_faults) as f64 / elapsed;
-
-        let voluntary_per_sec = (current.stats.voluntary_context_switches
-            - previous.stats.voluntary_context_switches) as f64
+        let minor_faults_per_sec = current
+            .stats
+            .minor_faults
+            .saturating_sub(previous.stats.minor_faults) as f64
             / elapsed;
 
-        let involuntary_per_sec = (current.stats.involuntary_context_switches
-            - previous.stats.involuntary_context_switches) as f64
+        let major_faults_per_sec = current
+            .stats
+            .major_faults
+            .saturating_sub(previous.stats.major_faults) as f64
+            / elapsed;
+
+        let voluntary_per_sec = current
+            .stats
+            .voluntary_context_switches
+            .saturating_sub(previous.stats.voluntary_context_switches)
+            as f64
+            / elapsed;
+
+        let involuntary_per_sec = current
+            .stats
+            .involuntary_context_switches
+            .saturating_sub(previous.stats.involuntary_context_switches)
+            as f64
             / elapsed;
 
         println!("{} ({})", current.stats.name, current.stats.pid);
@@ -569,7 +605,6 @@ fn print_threads(pid: u32) -> Result<(), LurkError> {
 fn watch_threads(pid: u32) -> Result<(), LurkError> {
     let ticks_per_second = clock_ticks_per_second();
     let mut previous = take_thread_snapshot(pid)?;
-
     let mut migration_counts: HashMap<(u32, u64), u64> = HashMap::new();
 
     loop {
@@ -718,9 +753,223 @@ fn print_stats(stats: &ProcessStats) {
     );
 }
 
+fn parse_io_u64(value: &str, field: &'static str) -> Result<u64, LurkError> {
+    value.parse::<u64>().map_err(|_| LurkError::InvalidIoField {
+        field,
+        value: value.to_string(),
+    })
+}
+
+fn parse_io_i64(value: &str, field: &'static str) -> Result<i64, LurkError> {
+    value.parse::<i64>().map_err(|_| LurkError::InvalidIoField {
+        field,
+        value: value.to_string(),
+    })
+}
+
+fn parse_io(contents: &str) -> Result<IoStats, LurkError> {
+    let mut rchar = None;
+    let mut wchar = None;
+    let mut syscr = None;
+    let mut syscw = None;
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+    let mut cancelled_write_bytes = None;
+
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+
+        let key = key.trim();
+        let value = value.trim();
+
+        match key {
+            "rchar" => rchar = Some(parse_io_u64(value, "rchar")?),
+            "wchar" => wchar = Some(parse_io_u64(value, "wchar")?),
+            "syscr" => syscr = Some(parse_io_u64(value, "syscr")?),
+            "syscw" => syscw = Some(parse_io_u64(value, "syscw")?),
+            "read_bytes" => read_bytes = Some(parse_io_u64(value, "read_bytes")?),
+            "write_bytes" => write_bytes = Some(parse_io_u64(value, "write_bytes")?),
+            "cancelled_write_bytes" => {
+                cancelled_write_bytes = Some(parse_io_i64(value, "cancelled_write_bytes")?)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(IoStats {
+        rchar: rchar.ok_or(LurkError::MalformedIo("missing rchar"))?,
+        wchar: wchar.ok_or(LurkError::MalformedIo("missing wchar"))?,
+        syscr: syscr.ok_or(LurkError::MalformedIo("missing syscr"))?,
+        syscw: syscw.ok_or(LurkError::MalformedIo("missing syscw"))?,
+        read_bytes: read_bytes.ok_or(LurkError::MalformedIo("missing read_bytes"))?,
+        write_bytes: write_bytes.ok_or(LurkError::MalformedIo("missing write_bytes"))?,
+        cancelled_write_bytes: cancelled_write_bytes
+            .ok_or(LurkError::MalformedIo("missing cancelled_write_bytes"))?,
+    })
+}
+
+fn read_io_stats(pid: u32) -> Result<IoStats, LurkError> {
+    let contents = read_proc_file(pid, "io")?;
+    parse_io(&contents)
+}
+
+fn take_io_snapshot(pid: u32) -> Result<IoSnapshot, LurkError> {
+    let timestamp = Instant::now();
+
+    let before = read_stat_only(pid)?;
+    let io = read_io_stats(pid)?;
+    let after = read_stat_only(pid)?;
+
+    if before.start_time_ticks != after.start_time_ticks {
+        return Err(LurkError::ProcessReused(pid));
+    }
+
+    Ok(IoSnapshot {
+        process: after,
+        io,
+        timestamp,
+    })
+}
+
+fn print_io(pid: u32) -> Result<(), LurkError> {
+    let snapshot = take_io_snapshot(pid)?;
+
+    println!(
+        "Process: {} ({})",
+        snapshot.process.name, snapshot.process.pid
+    );
+    println!();
+    println!("Cumulative I/O");
+    println!(
+        "Logical read:       {:>12.2} MiB",
+        bytes_to_mib(snapshot.io.rchar)
+    );
+    println!(
+        "Logical write:      {:>12.2} MiB",
+        bytes_to_mib(snapshot.io.wchar)
+    );
+    println!(
+        "Disk read:          {:>12.2} MiB",
+        bytes_to_mib(snapshot.io.read_bytes)
+    );
+    println!(
+        "Accounted write:    {:>12.2} MiB",
+        bytes_to_mib(snapshot.io.write_bytes)
+    );
+    println!("Read operations:    {:>12}", snapshot.io.syscr);
+    println!("Write operations:   {:>12}", snapshot.io.syscw);
+    println!(
+        "Cancelled write:    {:>12.2} MiB",
+        signed_bytes_to_mib(snapshot.io.cancelled_write_bytes)
+    );
+
+    Ok(())
+}
+
+fn watch_io(pid: u32) -> Result<(), LurkError> {
+    let mut previous = take_io_snapshot(pid)?;
+
+    loop {
+        thread::sleep(Duration::from_secs(1));
+
+        let current = match take_io_snapshot(pid) {
+            Ok(snapshot) => snapshot,
+            Err(LurkError::ProcessNotFound(_)) => {
+                println!("process {pid} exited");
+                return Ok(());
+            }
+            Err(LurkError::ProcessReused(_)) => {
+                println!("process {pid} exited; PID was reused");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        if previous.process.start_time_ticks != current.process.start_time_ticks {
+            println!("process {pid} exited; PID was reused");
+            return Ok(());
+        }
+
+        let elapsed = current
+            .timestamp
+            .duration_since(previous.timestamp)
+            .as_secs_f64();
+
+        let delta_rchar = current.io.rchar.saturating_sub(previous.io.rchar);
+        let delta_wchar = current.io.wchar.saturating_sub(previous.io.wchar);
+        let delta_read_bytes = current.io.read_bytes.saturating_sub(previous.io.read_bytes);
+        let delta_write_bytes = current
+            .io
+            .write_bytes
+            .saturating_sub(previous.io.write_bytes);
+
+        let delta_cancelled_write_bytes = current
+            .io
+            .cancelled_write_bytes
+            .saturating_sub(previous.io.cancelled_write_bytes);
+
+        let delta_syscr = current.io.syscr.saturating_sub(previous.io.syscr);
+        let delta_syscw = current.io.syscw.saturating_sub(previous.io.syscw);
+
+        let logical_read_mib = bytes_to_mib(delta_rchar) / elapsed;
+        let logical_write_mib = bytes_to_mib(delta_wchar) / elapsed;
+        let disk_read_mib = bytes_to_mib(delta_read_bytes) / elapsed;
+        let accounted_write_mib = bytes_to_mib(delta_write_bytes) / elapsed;
+        let cancelled_write_mib = signed_bytes_to_mib(delta_cancelled_write_bytes) / elapsed;
+
+        let read_ops_per_sec = delta_syscr as f64 / elapsed;
+        let write_ops_per_sec = delta_syscw as f64 / elapsed;
+
+        let avg_read_kib = if delta_syscr == 0 {
+            0.0
+        } else {
+            delta_rchar as f64 / delta_syscr as f64 / 1024.0
+        };
+
+        let avg_write_kib = if delta_syscw == 0 {
+            0.0
+        } else {
+            delta_wchar as f64 / delta_syscw as f64 / 1024.0
+        };
+
+        println!("{} ({})", current.process.name, current.process.pid);
+        println!("Logical read:       {:>10.2} MiB/s", logical_read_mib);
+        println!("Logical write:      {:>10.2} MiB/s", logical_write_mib);
+        println!("Disk read:          {:>10.2} MiB/s", disk_read_mib);
+        println!("Accounted write:    {:>10.2} MiB/s", accounted_write_mib);
+        println!("Cancelled write:    {:>10.2} MiB/s", cancelled_write_mib);
+        println!("Read operations:    {:>10.2} /s", read_ops_per_sec);
+        println!("Write operations:   {:>10.2} /s", write_ops_per_sec);
+        println!("Avg read/op:        {:>10.2} KiB", avg_read_kib);
+        println!("Avg write/op:       {:>10.2} KiB", avg_write_kib);
+        println!();
+
+        previous = current;
+    }
+}
+
 fn run() -> Result<(), LurkError> {
     let mut args = env::args().skip(1);
     let first = args.next().ok_or(LurkError::Usage)?;
+
+    if first == "io" {
+        let pid_arg = args.next().ok_or(LurkError::Usage)?;
+        let option = args.next();
+
+        if args.next().is_some() {
+            return Err(LurkError::Usage);
+        }
+
+        let pid = parse_pid(&pid_arg)?;
+
+        return match option.as_deref() {
+            None => print_io(pid),
+            Some("--watch") => watch_io(pid),
+            Some(_) => Err(LurkError::Usage),
+        };
+    }
 
     if first == "watch" {
         let pid_arg = args.next().ok_or(LurkError::Usage)?;
@@ -857,5 +1106,28 @@ mod tests {
         assert_eq!(stats.start_time_ticks, 19);
         assert_eq!(stats.processor, 36);
         assert_eq!(stats.allowed_cpus, "");
+    }
+
+    #[test]
+    fn parses_proc_io() {
+        let input = "\
+    rchar: 1048576
+    wchar: 2097152
+    syscr: 100
+    syscw: 50
+    read_bytes: 524288
+    write_bytes: 1048576
+    cancelled_write_bytes: 4096
+    ";
+
+        let stats = parse_io(input).unwrap();
+
+        assert_eq!(stats.rchar, 1_048_576);
+        assert_eq!(stats.wchar, 2_097_152);
+        assert_eq!(stats.syscr, 100);
+        assert_eq!(stats.syscw, 50);
+        assert_eq!(stats.read_bytes, 524_288);
+        assert_eq!(stats.write_bytes, 1_048_576);
+        assert_eq!(stats.cancelled_write_bytes, 4096);
     }
 }
